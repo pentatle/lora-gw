@@ -218,12 +218,102 @@ void task_lora_gateway(void *pvParameters) {
         TickType_t elapsed_time = xTaskGetTickCount() - start_time;
 
         if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_REQUEST_DATA_TASK_MS)) {
-            // -------------------------------------------------------HELP ME WRITE CODE HERE-------------------------------------------------------
+            for (int i = 0; i < node_count; i++) {
+                uint8_t buf[256];
+                int retries = 0;
+                uint8_t node_id = nodes[i].id;
 
-                    
-            // -------------------------------------------------------HELP ME WRITE CODE HERE-------------------------------------------------------
-           
-        } 
+                // Send "id R" request to node
+                int send_len = sprintf((char *)buf, "%d R", node_id);
+                lora_send_packet((uint8_t *)buf, send_len);
+                ESP_LOGI(TAG, "Sent request to node %d: %s", node_id, buf);
+
+                // Listen for ACK
+                TickType_t ack_start_time = xTaskGetTickCount();
+                int ack_received = 0;
+
+                while ((xTaskGetTickCount() - ack_start_time) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
+                    lora_receive();
+                    if (lora_received()) {
+                        int rxLen = lora_receive_packet(buf, sizeof(buf));
+                        buf[rxLen] = '\0'; // Null-terminate for safe string handling
+                        if (sscanf((char *)buf, "%hhu ACK", &node_id) == 1) {
+                            ESP_LOGI(TAG, "ACK received from node %d.", node_id);
+                            ack_received = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (!ack_received) {
+                    ESP_LOGW(TAG, "No ACK received from node %d. Retrying...", node_id);
+                    if (++retries > MAX_RETRIES) {
+                        ESP_LOGE(TAG, "Node %d did not respond after %d retries. Skipping.", node_id, MAX_RETRIES);
+                        continue;
+                    }
+                    i--; // Retry the same node
+                    continue;
+                }
+
+                // Listen for data packet
+                TickType_t data_start_time = xTaskGetTickCount();
+                int data_received = 0;
+                float t = -1, d = -1;
+
+                while ((xTaskGetTickCount() - data_start_time) < pdMS_TO_TICKS(ONE_DATA_PACKET_SEND_INTERVAL_MS)) {
+                    lora_receive();
+                    if (lora_received()) {
+                        int rxLen = lora_receive_packet(buf, sizeof(buf));
+                        buf[rxLen] = '\0'; // Null-terminate for safe string handling
+                        if (sscanf((char *)buf, "%hhu %f %f", &node_id, &t, &d) == 3) {
+                            ESP_LOGI(TAG, "Data received from node %d: Temp=%.1f, Humidity=%.1f", node_id, t, d);
+                            if (node_id == nodes[i].id) {
+                                nodes[i].t = t;
+                                nodes[i].d = d;
+                                data_received = 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (!data_received) {
+                    ESP_LOGW(TAG, "No data received from node %d within timeout.", node_id);
+                    continue;
+                }
+
+                // Send "Ok" packet
+                send_len = sprintf((char *)buf, "%d Ok", node_id);
+                lora_send_packet((uint8_t *)buf, send_len);
+                ESP_LOGI(TAG, "Sent 'Ok' to node %d.", node_id);
+
+                // Listen for ACK to "Ok"
+                ack_start_time = xTaskGetTickCount();
+                ack_received = 0;
+
+                while ((xTaskGetTickCount() - ack_start_time) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
+                    lora_receive();
+                    if (lora_received()) {
+                        int rxLen = lora_receive_packet(buf, sizeof(buf));
+                        buf[rxLen] = '\0';
+                        if (sscanf((char *)buf, "%hhu ACK", &node_id) == 1) {
+                            ESP_LOGI(TAG, "ACK received for 'Ok' from node %d.", node_id);
+                            ack_received = 1;
+                            break;
+                        }
+                    }
+                }
+
+                if (!ack_received) {
+                    ESP_LOGW(TAG, "No ACK received for 'Ok' from node %d. Retrying...", node_id);
+                    if (++retries > MAX_RETRIES) {
+                        ESP_LOGE(TAG, "Node %d did not respond to 'Ok' after %d retries. Skipping.", node_id, MAX_RETRIES);
+                    } else {
+                        i--; // Retry the same node
+                    }
+                }
+            }
+        }
     }
     // -------------------------------------------------------End request data phase-------------------------------------------------------
 
