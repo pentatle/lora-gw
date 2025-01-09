@@ -15,14 +15,18 @@
 
 #include "lora.h"
 
-#define BROADCAST_INTERVAL_MS 100
-#define TIMEOUT_MS 6000
+#define BROADCAST_LISTEN_INTERVAL_MS 100  // Short delay to avoid overloading
+#define ONE_DATA_PACKET_SEND_INTERVAL_MS 100  
+#define TIMEOUT_ASSIGN_TASK_MS 6000
+#define TIMEOUT_REQUEST_DATA_TASK_MS 6000
+#define ACK_LISTEN_TIMEOUT_MS 100
 #define MAX_NODES 20
 #define JOIN_REQUEST_BUF "Open"
 #define MAX_RETRIES 3
 
 typedef struct {
     uint8_t id;
+    uint8_t count;
     float latitude;
     float longitude;
     float t; // Temperature
@@ -72,7 +76,7 @@ static void add_node(uint8_t id, float latitude, float longitude, float t, float
             nodes[i].t = t;
             nodes[i].d = d;
             nodes[i].last_seen = xTaskGetTickCount();
-            ESP_LOGI(TAG, "Node %d updated. Lat: %.2f, Lon: %.2f, Temp: %.2f, Humidity: %.2f", id, latitude, longitude, t, d);
+            ESP_LOGI(TAG, "Node %d updated. Lat: %.1f, Lon: %.1f, Temp: %.1f, Humidity: %.1f", id, latitude, longitude, t, d);
             return;
         }
     }
@@ -100,13 +104,14 @@ static void add_node(uint8_t id, float latitude, float longitude, float t, float
     // Add node to the current cycle
     if (node_count < MAX_NODES) {
         nodes[node_count].id = id;
+        nodes[node_count].id = node_count+1;
         nodes[node_count].latitude = latitude;
         nodes[node_count].longitude = longitude;
         nodes[node_count].t = t;
         nodes[node_count].d = d;
         nodes[node_count].last_seen = xTaskGetTickCount();
         node_count++;
-        ESP_LOGI(TAG, "Node %d added to the network. Lat: %.2f, Lon: %.2f, Temp: %.2f, Humidity: %.2f", id, latitude, longitude, t, d);
+        ESP_LOGI(TAG, "Node %d added to the network. Lat: %.1f, Lon: %.1f, Temp: %.1f, Humidity: %.1f", id, latitude, longitude, t, d);
     } else {
         ESP_LOGW(TAG, "Node list full, cannot add node %d.", id);
     }
@@ -121,7 +126,7 @@ static int send_with_ack(const char *message, uint8_t expected_ack_id) {
         ESP_LOGI(TAG, "Sent: %s", message);
 
         TickType_t start_wait = xTaskGetTickCount();
-        while ((xTaskGetTickCount() - start_wait) < pdMS_TO_TICKS(1000)) { // 1 second timeout
+        while ((xTaskGetTickCount() - start_wait) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
             lora_receive();
             if (lora_received()) {
                 int rxLen = lora_receive_packet(buf, sizeof(buf));
@@ -151,51 +156,77 @@ static void send_ack(uint8_t id) {
 static void send_accept_packet(uint8_t id) {
     uint8_t buf[256];
     float T_min = 15.0, T_max = 30.0, H_min = 40.0, H_max = 60.0;
-    int send_len = sprintf((char *)buf, "%d STT %.2f %.2f %.2f %.2f", id, T_min, T_max, H_min, H_max);
+    int send_len = sprintf((char *)buf, "%d %d %.1f %.1f %.1f %.1f", id, node_count, T_min, T_max, H_min, H_max);
     send_with_ack((char *)buf, id);
 }
 
 void task_lora_gateway(void *pvParameters) {
     ESP_LOGI(TAG, "Gateway task started.");
+
+
+    // -------------------------------------------------------Assign phase-------------------------------------------------------
     uint8_t buf[256];
     TickType_t start_time = xTaskGetTickCount();
-
     while (1) {
         TickType_t elapsed_time = xTaskGetTickCount() - start_time;
 
-        if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_MS)) {
+        if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_ASSIGN_TASK_MS)) {
+
             // Broadcast message
             int send_len = sprintf((char *)buf, JOIN_REQUEST_BUF);
             lora_send_packet((uint8_t *)buf, send_len);
-            ESP_LOGI(TAG, "Broadcasted: %s", buf);
+            ESP_LOGI(TAG, "Broadcasted: %s (length: %d bytes)", buf, send_len);
 
-            // Listen for responses
-            lora_receive();
-            if (lora_received()) {
-                int rxLen = lora_receive_packet(buf, sizeof(buf));
-                buf[rxLen] = '\0'; // Null-terminate for safe string handling
-                ESP_LOGI(TAG, "Received: %s", buf);
+            // Listen for responses until timeout
+            TickType_t listen_start_time = xTaskGetTickCount();
+            while ((xTaskGetTickCount() - listen_start_time) < pdMS_TO_TICKS(BROADCAST_LISTEN_INTERVAL_MS)) {
+                lora_receive();
+                if (lora_received()) {
+                    int rxLen = lora_receive_packet(buf, sizeof(buf));
+                    buf[rxLen] = '\0'; // Null-terminate for safe string handling
+                    ESP_LOGI(TAG, "Received: %s", buf);
 
-                if (strncmp((char *)buf, "id", 2) == 0) {
-                    uint8_t node_id;
-                    float latitude, longitude, t = -1, d = -1;
-                    if (sscanf((char *)buf, "id %hhu %f %f %f %f", &node_id, &latitude, &longitude, &t, &d) >= 3) {
-                        send_ack(node_id);
-                        add_node(node_id, latitude, longitude, t, d);
-                        send_accept_packet(node_id);
-                    } else {
-                        ESP_LOGW(TAG, "Invalid assign packet format.");
+                    if (strncmp((char *)buf, "1", 1) == 0) {
+                        uint8_t node_id;
+                        float latitude, longitude, t = -1, d = -1;
+                        if (sscanf((char *)buf, "%hhd %f %f", &node_id, &latitude, &longitude) >= 3) {
+                            send_ack(node_id);
+                            add_node(node_id, latitude, longitude, t, d);
+                            send_accept_packet(node_id);
+                            break;
+                        } else {
+                            ESP_LOGW(TAG, "Invalid assign packet format.");
+                        }
                     }
                 }
+                
+                vTaskDelay(pdMS_TO_TICKS(BROADCAST_LISTEN_INTERVAL_MS)); // Short delay to avoid overloading
             }
-        } else {
-            ESP_LOGI(TAG, "Timeout reached. Resetting node lists.");
-            reset_nodes();
-            start_time = xTaskGetTickCount();
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(BROADCAST_INTERVAL_MS));
+        } 
+        // else {
+        //     ESP_LOGI(TAG, "Timeout reached. Resetting node lists.");
+        //     reset_nodes();
+        //     start_time = xTaskGetTickCount();
+        // }
     }
+    // -------------------------------------------------------ENd assign phase-------------------------------------------------------
+
+
+    // -------------------------------------------------------Request data phase-------------------------------------------------------
+    TickType_t start_time = xTaskGetTickCount();
+    while (1) {
+        TickType_t elapsed_time = xTaskGetTickCount() - start_time;
+
+        if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_REQUEST_DATA_TASK_MS)) {
+            // -------------------------------------------------------HELP ME WRITE CODE HERE-------------------------------------------------------
+
+                    
+            // -------------------------------------------------------HELP ME WRITE CODE HERE-------------------------------------------------------
+           
+        } 
+    }
+    // -------------------------------------------------------End request data phase-------------------------------------------------------
+
 }
 
 void app_main() {
