@@ -15,18 +15,23 @@
 
 #include "lora.h"
 
-#define BROADCAST_LISTEN_INTERVAL_MS 100  // Short delay to avoid overloading
-#define ONE_DATA_PACKET_SEND_INTERVAL_MS 100  
+#define BROADCAST_LISTEN_INTERVAL_MS 1000  // Short delay to avoid overloading
+#define ONE_DATA_PACKET_SEND_INTERVAL_MS 4000
 #define TIMEOUT_ASSIGN_TASK_MS 6000
-#define TIMEOUT_REQUEST_DATA_TASK_MS 6000
-#define ACK_LISTEN_TIMEOUT_MS 100
+#define TIMEOUT_REQUEST_DATA_TASK_MS 12000
+#define CYCLE_MS 20000
+#define ACK_LISTEN_TIMEOUT_MS 1000
 #define MAX_NODES 20
 #define JOIN_REQUEST_BUF "Open"
 #define MAX_RETRIES 3
+#define T_MIN 15.0
+#define T_MAX 30.0
+#define H_MIN 40.0
+#define H_MAX 60.0
+
 
 typedef struct {
     uint8_t id;
-    uint8_t count;
     float latitude;
     float longitude;
     float t; // Temperature
@@ -104,7 +109,6 @@ static void add_node(uint8_t id, float latitude, float longitude, float t, float
     // Add node to the current cycle
     if (node_count < MAX_NODES) {
         nodes[node_count].id = id;
-        nodes[node_count].id = node_count+1;
         nodes[node_count].latitude = latitude;
         nodes[node_count].longitude = longitude;
         nodes[node_count].t = t;
@@ -123,17 +127,22 @@ static int send_with_ack(const char *message, uint8_t expected_ack_id) {
 
     while (retries <= MAX_RETRIES) {
         lora_send_packet((uint8_t *)message, strlen(message));
-        ESP_LOGI(TAG, "Sent: %s", message);
-
+        return 1;//test----------------------------------------------
         TickType_t start_wait = xTaskGetTickCount();
         while ((xTaskGetTickCount() - start_wait) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
             lora_receive();
             if (lora_received()) {
                 int rxLen = lora_receive_packet(buf, sizeof(buf));
-                buf[rxLen] = '\0';
+                buf[rxLen] = '\0';  // Đảm bảo chuỗi hợp lệ
                 ESP_LOGI(TAG, "Received: %s", buf);
-                if (sscanf((char *)buf, "%hhu ACK", &expected_ack_id) == 1) {
-                    return 1; // ACK received
+
+                // Trích xuất giá trị id và kiểm tra phần "ACK"
+                unsigned char received_ack_id;
+                if (sscanf((char *)buf, "%hhu ACK", &received_ack_id) == 1) {
+                    // Kiểm tra nếu id trong buf khớp với expected_ack_id
+                    if (received_ack_id == expected_ack_id) {
+                        return 1; // ACK hợp lệ đã nhận
+                    }
                 }
             }
         }
@@ -155,168 +164,141 @@ static void send_ack(uint8_t id) {
 
 static void send_accept_packet(uint8_t id) {
     uint8_t buf[256];
-    float T_min = 15.0, T_max = 30.0, H_min = 40.0, H_max = 60.0;
-    int send_len = sprintf((char *)buf, "%d %d %.1f %.1f %.1f %.1f", id, node_count, T_min, T_max, H_min, H_max);
+    float T_min = T_MIN, T_max = T_MAX, H_min = H_MIN, H_max = H_MAX;
+    sprintf((char *)buf, "%d %d %.1f %.1f %.1f %.1f", id, node_count, T_min, T_max, H_min, H_max);
+    ESP_LOGI(TAG, "Sent %s.", buf);
+    if (send_with_ack((char *)buf, id)){
+        ESP_LOGI(TAG, "Sent accept packet to node %d.", id);
+    }
+    else{
+        ESP_LOGW(TAG, "Failed to send accept packet to node %d.", id);
+    }  
+}
+static void send_request_packet(uint8_t id) {
+    uint8_t buf[256];
+    sprintf((char *)buf, "%d R", id);
+    ESP_LOGI(TAG, "Sent request to node %d: %s", id, buf);
     send_with_ack((char *)buf, id);
+    if (send_with_ack((char *)buf, id)){
+        ESP_LOGI(TAG, "Sent request packet to node %d.", id);
+    }
+    else{
+        ESP_LOGW(TAG, "Failed to send request packet to node %d.", id);
+    }
+}
+
+static void send_ok_packet(uint8_t id) {
+    uint8_t buf[256];
+    sprintf((char *)buf, "%d Ok", id);
+    ESP_LOGI(TAG, "Sent Ok to node %d: %s", id, buf);
+    send_with_ack((char *)buf, id);
+    if (send_with_ack((char *)buf, id)){
+        ESP_LOGI(TAG, "Sent Ok packet to node %d.", id);
+    }
+    else{
+        ESP_LOGW(TAG, "Failed to send Ok packet to node %d.", id);
+    }
 }
 
 void task_lora_gateway(void *pvParameters) {
     ESP_LOGI(TAG, "Gateway task started.");
+    // Lưu lại thời gian bắt đầu để tính chu kỳ
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    while (1)
+    {    
+        ESP_LOGI(TAG, "Timeout reached. Resetting node lists.");
+        reset_nodes();
 
 
-    // -------------------------------------------------------Assign phase-------------------------------------------------------
-    uint8_t buf[256];
-    TickType_t start_time = xTaskGetTickCount();
-    while (1) {
-        TickType_t elapsed_time = xTaskGetTickCount() - start_time;
-
-        if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_ASSIGN_TASK_MS)) {
+        // -------------------------------------------------------Assign phase-------------------------------------------------------
+        uint8_t buf[256];
+        TickType_t start_time = xTaskGetTickCount();
+        while (xTaskGetTickCount() - start_time < pdMS_TO_TICKS(TIMEOUT_REQUEST_DATA_TASK_MS)) {
+            // Start one sub assign phase
+            TickType_t sub_start_time = xTaskGetTickCount();
 
             // Broadcast message
             int send_len = sprintf((char *)buf, JOIN_REQUEST_BUF);
             lora_send_packet((uint8_t *)buf, send_len);
             ESP_LOGI(TAG, "Broadcasted: %s (length: %d bytes)", buf, send_len);
 
-            // Listen for responses until timeout
-            TickType_t listen_start_time = xTaskGetTickCount();
-            while ((xTaskGetTickCount() - listen_start_time) < pdMS_TO_TICKS(BROADCAST_LISTEN_INTERVAL_MS)) {
+            // Listen for assign packets
+            while ((xTaskGetTickCount() - sub_start_time) < pdMS_TO_TICKS(BROADCAST_LISTEN_INTERVAL_MS)) {
+                // ESP_LOGI(TAG, "Listening for assign packets...");
                 lora_receive();
                 if (lora_received()) {
                     int rxLen = lora_receive_packet(buf, sizeof(buf));
                     buf[rxLen] = '\0'; // Null-terminate for safe string handling
                     ESP_LOGI(TAG, "Received: %s", buf);
 
-                    if (strncmp((char *)buf, "1", 1) == 0) {
-                        uint8_t node_id;
-                        float latitude, longitude, t = -1, d = -1;
-                        if (sscanf((char *)buf, "%hhd %f %f", &node_id, &latitude, &longitude) >= 3) {
-                            send_ack(node_id);
-                            add_node(node_id, latitude, longitude, t, d);
-                            send_accept_packet(node_id);
-                            break;
-                        } else {
-                            ESP_LOGW(TAG, "Invalid assign packet format.");
-                        }
+                    
+                    uint8_t node_id;
+                    float latitude, longitude, t = -1, d = -1;
+                    if (sscanf((char *)buf, "%hhd %f %f", &node_id, &latitude, &longitude) >= 3) {
+                        // send_ack(node_id);
+                        add_node(node_id, latitude, longitude, t, d);
+                        send_accept_packet(node_id);
+                        break;
                     }
                 }
                 
-                vTaskDelay(pdMS_TO_TICKS(BROADCAST_LISTEN_INTERVAL_MS)); // Short delay to avoid overloading
-            }
-        } 
-        // else {
-        //     ESP_LOGI(TAG, "Timeout reached. Resetting node lists.");
-        //     reset_nodes();
-        //     start_time = xTaskGetTickCount();
-        // }
-    }
-    // -------------------------------------------------------ENd assign phase-------------------------------------------------------
-
-
-    // -------------------------------------------------------Request data phase-------------------------------------------------------
-    TickType_t start_time = xTaskGetTickCount();
-    while (1) {
-        TickType_t elapsed_time = xTaskGetTickCount() - start_time;
-
-        if (elapsed_time < pdMS_TO_TICKS(TIMEOUT_REQUEST_DATA_TASK_MS)) {
-            for (int i = 0; i < node_count; i++) {
-                uint8_t buf[256];
-                int retries = 0;
-                uint8_t node_id = nodes[i].id;
-
-                // Send "id R" request to node
-                int send_len = sprintf((char *)buf, "%d R", node_id);
-                lora_send_packet((uint8_t *)buf, send_len);
-                ESP_LOGI(TAG, "Sent request to node %d: %s", node_id, buf);
-
-                // Listen for ACK
-                TickType_t ack_start_time = xTaskGetTickCount();
-                int ack_received = 0;
-
-                while ((xTaskGetTickCount() - ack_start_time) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
-                    lora_receive();
-                    if (lora_received()) {
-                        int rxLen = lora_receive_packet(buf, sizeof(buf));
-                        buf[rxLen] = '\0'; // Null-terminate for safe string handling
-                        if (sscanf((char *)buf, "%hhu ACK", &node_id) == 1) {
-                            ESP_LOGI(TAG, "ACK received from node %d.", node_id);
-                            ack_received = 1;
-                            break;
-                        }
-                    }
-                }
-
-                if (!ack_received) {
-                    ESP_LOGW(TAG, "No ACK received from node %d. Retrying...", node_id);
-                    if (++retries > MAX_RETRIES) {
-                        ESP_LOGE(TAG, "Node %d did not respond after %d retries. Skipping.", node_id, MAX_RETRIES);
-                        continue;
-                    }
-                    i--; // Retry the same node
-                    continue;
-                }
-
-                // Listen for data packet
-                TickType_t data_start_time = xTaskGetTickCount();
-                int data_received = 0;
-                float t = -1, d = -1;
-
-                while ((xTaskGetTickCount() - data_start_time) < pdMS_TO_TICKS(ONE_DATA_PACKET_SEND_INTERVAL_MS)) {
-                    lora_receive();
-                    if (lora_received()) {
-                        int rxLen = lora_receive_packet(buf, sizeof(buf));
-                        buf[rxLen] = '\0'; // Null-terminate for safe string handling
-                        if (sscanf((char *)buf, "%hhu %f %f", &node_id, &t, &d) == 3) {
-                            ESP_LOGI(TAG, "Data received from node %d: Temp=%.1f, Humidity=%.1f", node_id, t, d);
-                            if (node_id == nodes[i].id) {
-                                nodes[i].t = t;
-                                nodes[i].d = d;
-                                data_received = 1;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (!data_received) {
-                    ESP_LOGW(TAG, "No data received from node %d within timeout.", node_id);
-                    continue;
-                }
-
-                // Send "Ok" packet
-                send_len = sprintf((char *)buf, "%d Ok", node_id);
-                lora_send_packet((uint8_t *)buf, send_len);
-                ESP_LOGI(TAG, "Sent 'Ok' to node %d.", node_id);
-
-                // Listen for ACK to "Ok"
-                ack_start_time = xTaskGetTickCount();
-                ack_received = 0;
-
-                while ((xTaskGetTickCount() - ack_start_time) < pdMS_TO_TICKS(ACK_LISTEN_TIMEOUT_MS)) {
-                    lora_receive();
-                    if (lora_received()) {
-                        int rxLen = lora_receive_packet(buf, sizeof(buf));
-                        buf[rxLen] = '\0';
-                        if (sscanf((char *)buf, "%hhu ACK", &node_id) == 1) {
-                            ESP_LOGI(TAG, "ACK received for 'Ok' from node %d.", node_id);
-                            ack_received = 1;
-                            break;
-                        }
-                    }
-                }
-
-                if (!ack_received) {
-                    ESP_LOGW(TAG, "No ACK received for 'Ok' from node %d. Retrying...", node_id);
-                    if (++retries > MAX_RETRIES) {
-                        ESP_LOGE(TAG, "Node %d did not respond to 'Ok' after %d retries. Skipping.", node_id, MAX_RETRIES);
-                    } else {
-                        i--; // Retry the same node
-                    }
-                }
+                vTaskDelay(1); // Avoid WatchDog alerts
             }
         }
-    }
-    // -------------------------------------------------------End request data phase-------------------------------------------------------
+        // -------------------------------------------------------ENd assign phase-------------------------------------------------------
 
+
+        // -------------------------------------------------------Request data phase-------------------------------------------------------
+        start_time = xTaskGetTickCount();
+        for (int i = 0; (i < node_count)&(xTaskGetTickCount() - start_time < pdMS_TO_TICKS(TIMEOUT_REQUEST_DATA_TASK_MS)); i++) {
+            
+            TickType_t sub_start_time = xTaskGetTickCount();
+
+            uint8_t buf[256];
+            uint8_t node_id = nodes[i].id;
+
+            // Send "id R" request to node
+            send_request_packet(node_id);
+
+            // Listen for data packet
+            int data_received = 0;
+            float t = -1, d = -1;
+
+            
+            while ((xTaskGetTickCount() - sub_start_time) < pdMS_TO_TICKS(ONE_DATA_PACKET_SEND_INTERVAL_MS)) {
+                // ESP_LOGI(TAG, "Listening for data packets...");
+                lora_receive();
+                if (lora_received()) {
+                    int rxLen = lora_receive_packet(buf, sizeof(buf));
+                    buf[rxLen] = '\0'; // Null-terminate for safe string handling
+                    if (sscanf((char *)buf, "%hhu %f %f", &node_id, &t, &d) == 3) {
+                        if (node_id == nodes[i].id) {
+                            nodes[i].t = t;
+                            nodes[i].d = d;
+                            data_received = 1;
+                            ESP_LOGI(TAG, "Data received from node %d: Temp=%.1f, Humidity=%.1f", node_id, t, d);
+                            // send_ack(node_id);
+                            break;
+                        }                                              
+                    }
+                }
+                vTaskDelay(1); // Avoid WatchDog alerts
+            }
+
+            if (!data_received) {
+                ESP_LOGW(TAG, "No data received from node %d within timeout.", node_id);
+                continue;
+            }
+
+            // Send "Ok" packet
+            send_ok_packet(node_id);
+
+        }
+        // -------------------------------------------------------End request data phase-------------------------------------------------------
+        
+        
+        vTaskDelayUntil(&xLastWakeTime, CYCLE_MS / portTICK_PERIOD_MS);
+    }
 }
 
 void app_main() {
